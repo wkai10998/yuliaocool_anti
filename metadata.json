@@ -1,0 +1,7 @@
+{
+  "name": "yuliaocool",
+  "description": "An AI-powered English speaking assistant transforming passive vocabulary into active output through context-based learning and shadowing exercises.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
