@@ -1,9 +1,9 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Mic, RotateCcw, CheckCircle, Volume2, PlayCircle, Loader2, Sparkles, Settings, X, Trophy, MessageSquare, PauseCircle, ChevronDown, Flag } from 'lucide-react';
+import { Mic, RotateCcw, CheckCircle, Volume2, PlayCircle, Loader2, Settings, X, Trophy, MessageSquare, PauseCircle, ChevronDown, Flag } from 'lucide-react';
 import { Button } from './Button';
 import { CorpusItem, LearnContext } from '../types';
-import { generateLearnContext, generateSpeech, evaluateAnswer } from '../services/zhipuService';
+import { generateLearnContext, generateSpeech } from '../services/zhipuService';
 import { audioPlayer } from '../services/audioService';
 
 interface LearnModeProps {
@@ -63,7 +63,6 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
   // Result State
   const [userAudioUrl, setUserAudioUrl] = useState<string | null>(null);
   const [userTranscript, setUserTranscript] = useState<string | null>(null);
-  const [aiEvaluation, setAiEvaluation] = useState<{ score: number, feedback: string } | null>(null);
   const [showResult, setShowResult] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
 
@@ -118,14 +117,12 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
       setNextItem(null);
       setNextContext(null);
       setCachedRefAudio(null);
-      setAiEvaluation(null);
       setInputText("");
       return;
     }
 
     setIsLoading(true);
     setCachedRefAudio(null);
-    setAiEvaluation(null);
     setInputText("");
 
     // 2. Try Cache (if not a retry)
@@ -202,6 +199,7 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
     }
   }, [currentItem, pickNextItem, topic]);
 
+  // 音频预取
   useEffect(() => {
     if (context?.englishReference && !cachedRefAudio) {
       const prefetchAudio = async () => {
@@ -288,13 +286,7 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
 
         stream.getTracks().forEach(track => track.stop());
 
-        if (!transcript || !transcript.trim()) {
-          setAiEvaluation({ score: 0, feedback: "No speech detected." });
-        } else if (context?.englishReference) {
-          const evalResult = await evaluateAnswer(transcript, context.englishReference);
-          setAiEvaluation(evalResult);
-        }
-
+        // 移除 AI 评估，直接显示结果对比
         setIsProcessingAudio(false);
         setShowResult(true);
       };
@@ -337,10 +329,7 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
     setIsProcessingAudio(true);
     setUserTranscript(inputText);
 
-    if (context?.englishReference) {
-      const evalResult = await evaluateAnswer(inputText, context.englishReference);
-      setAiEvaluation(evalResult);
-    }
+    // 移除 AI 评估，直接显示结果对比
     setIsProcessingAudio(false);
     setShowResult(true);
   };
@@ -419,7 +408,6 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
     setShowResult(false);
     setUserAudioUrl(null);
     setUserTranscript(null);
-    setAiEvaluation(null);
     setIsRecording(false);
     setCachedRefAudio(null);
     setIsRefAudioPlaying(false);
@@ -686,14 +674,6 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
                       </button>
                     </div>
                     <p className="text-stone-700 font-medium font-serif text-left">{userTranscript || "No input detected"}</p>
-
-                    {aiEvaluation && (
-                      <div className={`mt-3 flex items-center gap-2 text-sm ${aiEvaluation.score >= 60 ? 'text-emerald-600' : 'text-orange-600'}`}>
-                        <Sparkles size={14} />
-                        <span className="font-medium">{aiEvaluation.feedback}</span>
-                        <span className="opacity-50">({aiEvaluation.score}%)</span>
-                      </div>
-                    )}
                   </div>
 
                   {/* Reference Container - Left Aligned */}

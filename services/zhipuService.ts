@@ -14,7 +14,7 @@ const ZHIPU_API_BASE = "https://open.bigmodel.cn/api/paas/v4";
 const ZHIPU_API_KEY = import.meta.env.VITE_ZHIPU_API_KEY || "";
 
 // 模型常量
-const MODEL_CHAT = "GLM-4.7-FlashX";
+const MODEL_CHAT = "GLM-4.5-Air";
 const MODEL_ASR = "glm-asr-2512";
 const MODEL_TTS = "glm-tts";
 
