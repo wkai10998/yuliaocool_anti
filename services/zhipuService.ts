@@ -341,25 +341,28 @@ export async function generateContextScenario(
     topic: string
 ): Promise<ContextScenario> {
     const prompt = `
-    TASK: Create a natural sight translation paragraph.
+    TASK: Create a CONCISE sight translation paragraph.
     TOPIC: ${topic}
     REQUIRED ENGLISH PHRASES (MUST INCLUDE ALL ${items.length}): ${items.join(", ")}
 
+    IMPORTANT CONSTRAINTS:
+    - Keep the paragraph SHORT: 40-60 words maximum.
+    - Make it natural and coherent, but concise.
+
     CRITICAL JSON FORMAT RULES:
-    1. 'chineseScript': A coherent Chinese story using the meaning of all phrases.
+    1. 'chineseScript': A short Chinese story (2-3 sentences) using the meaning of all phrases.
     2. 'highlights': Array of objects. 
-       - 'text': The EXACT SUBSTRING used in 'englishReference' (even if it is a conjugation like "scheduled" instead of "schedule"). This is mandatory for highlighting.
-       - 'original': The dictionary form of the English phrase (e.g. "schedule").
+       - 'text': The EXACT SUBSTRING used in 'englishReference'.
+       - 'original': The dictionary form of the English phrase.
        - 'translation': The Chinese meaning.
-       - IMPORTANT: NEVER put Chinese text in 'text' or 'original' fields.
     3. 'chineseHighlights': The exact Chinese substrings in 'chineseScript' that map to the phrases.
 
     Return JSON with this exact structure:
     {
       "topic": "场景主题",
-      "chineseScript": "中文故事",
+      "chineseScript": "简短中文故事（2-3句）",
       "chineseHighlights": ["高亮词1", "高亮词2"],
-      "englishReference": "English paragraph",
+      "englishReference": "Short English paragraph (40-60 words)",
       "highlights": [
         {"text": "exact phrase in English", "original": "dictionary form", "translation": "中文"}
       ]

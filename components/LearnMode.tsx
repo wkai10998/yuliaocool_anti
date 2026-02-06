@@ -21,16 +21,23 @@ const TOPIC_OPTIONS = [
 ];
 
 const CACHE_EXPIRY_MS = 3600 * 1000; // 1 hour
+const INITIAL_BATCH_SIZE = 3; // 首批快速生成数量（用于快速进入学习）
+const TOTAL_PREFETCH_TARGET = 10; // 总预生成目标
+const BACKGROUND_BATCH_SIZE = 3; // 后台每批补充数量
+const PREFETCH_THRESHOLD = 3; // 剩余多少时开始补充
 
 export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, onExit }) => {
-  // Current Item State
-  const [currentItem, setCurrentItem] = useState<CorpusItem | null>(null);
-  const [context, setContext] = useState<LearnContext | null>(null);
+  // === 批量预生成队列系统 ===
+  const [learningQueue, setLearningQueue] = useState<CorpusItem[]>([]); // 学习队列
+  const [currentIndex, setCurrentIndex] = useState(0); // 当前位置
+  const [contextCache, setContextCache] = useState<Map<string, LearnContext>>(new Map()); // 预生成缓存
+  const [isInitializing, setIsInitializing] = useState(true); // 初始化加载状态
+  const [initProgress, setInitProgress] = useState(0); // 初始化进度
+  const isPrefetchingRef = useRef(false); // 防止重复预取
 
-  // Prefetch State
-  const [nextItem, setNextItem] = useState<CorpusItem | null>(null);
-  const [nextContext, setNextContext] = useState<LearnContext | null>(null);
-  const [isPrefetching, setIsPrefetching] = useState(false);
+  // Current Item State (derived from queue)
+  const currentItem = learningQueue[currentIndex] || null;
+  const context = currentItem ? contextCache.get(currentItem.id) || null : null;
 
   // UI States
   const [isLoading, setIsLoading] = useState(false);
@@ -74,13 +81,192 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
   const [isUserAudioPlaying, setIsUserAudioPlaying] = useState(false);
   const userAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // --- Lifecycle & Cleanup ---
+  // === 选择学习队列 ===
+  const selectLearningQueue = useCallback((corpusList: CorpusItem[], count: number): CorpusItem[] => {
+    // 优先选择到期复习的词汇，按掌握程度排序
+    const dueItems = corpusList
+      .filter(i => i.nextReviewDate <= Date.now())
+      .sort((a, b) => a.masteryLevel - b.masteryLevel);
 
+    // 如果到期的不够，补充其他词汇
+    const otherItems = corpusList
+      .filter(i => i.nextReviewDate > Date.now())
+      .sort((a, b) => a.masteryLevel - b.masteryLevel);
+
+    const combined = [...dueItems, ...otherItems];
+    return combined.slice(0, Math.max(count, TOTAL_PREFETCH_TARGET * 2));
+  }, []);
+
+  // === 批量生成上下文 ===
+  const generateContextsForItems = useCallback(async (
+    items: CorpusItem[],
+    currentTopic: string,
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<Map<string, LearnContext>> => {
+    const results = new Map<string, LearnContext>();
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const cacheKey = `yuliaocool_learn_session_${item.id}`;
+
+      // 先尝试从 localStorage 读取缓存
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          const { context: cachedCtx, topic: cachedTopic, timestamp } = JSON.parse(cached);
+          if (cachedTopic === currentTopic && (Date.now() - timestamp < CACHE_EXPIRY_MS)) {
+            results.set(item.id, cachedCtx);
+            onProgress?.(i + 1, items.length);
+            continue;
+          }
+        } catch (e) {
+          localStorage.removeItem(cacheKey);
+        }
+      }
+
+      // 生成新的上下文
+      try {
+        const ctx = await generateLearnContext(item.english, false, currentTopic);
+        results.set(item.id, ctx);
+
+        // 保存到 localStorage
+        localStorage.setItem(cacheKey, JSON.stringify({
+          context: ctx,
+          topic: currentTopic,
+          timestamp: Date.now()
+        }));
+      } catch (e) {
+        console.error(`生成 ${item.english} 上下文失败:`, e);
+      }
+
+      onProgress?.(i + 1, items.length);
+    }
+
+    return results;
+  }, []);
+
+  // === 初始化会话 ===
+  const initSession = useCallback(async (currentTopic: string, targetCount: number) => {
+    setIsInitializing(true);
+    setInitProgress(0);
+    setContextCache(new Map());
+    setCurrentIndex(0);
+    setSessionProgress(0);
+    setIsSessionComplete(false);
+
+    // 1. 选择学习队列
+    const queue = selectLearningQueue(corpus, targetCount);
+    setLearningQueue(queue);
+
+    if (queue.length === 0) {
+      setIsInitializing(false);
+      return;
+    }
+
+    // 2. 首批快速生成（只生成 3 个，并行请求加速）
+    const firstBatch = queue.slice(0, Math.min(INITIAL_BATCH_SIZE, queue.length));
+
+    // 使用 Promise.all 并行请求，加速首批生成
+    const contextPromises = firstBatch.map(async (item, index) => {
+      const cacheKey = `yuliaocool_learn_session_${item.id}`;
+
+      // 先尝试从 localStorage 读取缓存
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          const { context: cachedCtx, topic: cachedTopic, timestamp } = JSON.parse(cached);
+          if (cachedTopic === currentTopic && (Date.now() - timestamp < CACHE_EXPIRY_MS)) {
+            return { id: item.id, context: cachedCtx };
+          }
+        } catch (e) {
+          localStorage.removeItem(cacheKey);
+        }
+      }
+
+      // 生成新的上下文
+      const ctx = await generateLearnContext(item.english, false, currentTopic);
+      localStorage.setItem(cacheKey, JSON.stringify({
+        context: ctx,
+        topic: currentTopic,
+        timestamp: Date.now()
+      }));
+      return { id: item.id, context: ctx };
+    });
+
+    // 逐个更新进度
+    let completed = 0;
+    const results = await Promise.all(
+      contextPromises.map(p => p.then(result => {
+        completed++;
+        setInitProgress(Math.round((completed / firstBatch.length) * 100));
+        return result;
+      }))
+    );
+
+    const contexts = new Map<string, LearnContext>();
+    results.forEach(r => {
+      if (r.context) contexts.set(r.id, r.context);
+    });
+
+    setContextCache(contexts);
+    setIsInitializing(false);
+
+    // 3. 立即触发后台补充
+    setTimeout(() => {
+      isPrefetchingRef.current = false; // 确保可以开始后台预取
+    }, 100);
+  }, [corpus, selectLearningQueue, generateContextsForItems]);
+
+  // === 后台补充预取 ===
+  const prefetchMoreIfNeeded = useCallback(async () => {
+    if (isPrefetchingRef.current) return;
+
+    const remainingInQueue = learningQueue.length - currentIndex - 1;
+    const prefetchedCount = Array.from(contextCache.keys())
+      .filter(id => {
+        const idx = learningQueue.findIndex(item => item.id === id);
+        return idx > currentIndex;
+      }).length;
+
+    // 计算还需要预取多少才能达到目标
+    const totalCached = contextCache.size;
+    const needMore = totalCached < TOTAL_PREFETCH_TARGET;
+
+    // 如果预取的数量少于阈值，或者总缓存未达目标，补充更多
+    if ((prefetchedCount < PREFETCH_THRESHOLD || needMore) && remainingInQueue > prefetchedCount) {
+      isPrefetchingRef.current = true;
+
+      const startIdx = currentIndex + prefetchedCount + 1;
+      const endIdx = Math.min(startIdx + BACKGROUND_BATCH_SIZE, learningQueue.length);
+      const itemsToFetch = learningQueue.slice(startIdx, endIdx)
+        .filter(item => !contextCache.has(item.id));
+
+      if (itemsToFetch.length > 0) {
+        console.log(`[Prefetch] 后台预取 ${itemsToFetch.length} 个词汇...`);
+        const newContexts = await generateContextsForItems(itemsToFetch, topic);
+
+        setContextCache(prev => {
+          const updated = new Map(prev);
+          newContexts.forEach((ctx, id) => updated.set(id, ctx));
+          return updated;
+        });
+      }
+
+      isPrefetchingRef.current = false;
+    }
+  }, [learningQueue, currentIndex, contextCache, topic, generateContextsForItems]);
+
+  // === 生命周期 ===
   useEffect(() => {
     // Check onboarding status
     const hasSeen = localStorage.getItem('yuliaocool_settings_guide');
     if (!hasSeen) {
       setShowOnboarding(true);
+    }
+
+    // 初始化会话
+    if (corpus.length > 0) {
+      initSession(topic, sessionTarget);
     }
 
     return () => {
@@ -92,132 +278,37 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
     };
   }, []);
 
-  // --- Selection Logic ---
-
-  const pickNextItem = useCallback((excludeId?: string) => {
-    let candidates = corpus;
-    if (corpus.length > 1 && excludeId) {
-      candidates = corpus.filter(c => c.id !== excludeId);
+  // === 后台预取触发 ===
+  useEffect(() => {
+    if (!isInitializing && currentItem) {
+      prefetchMoreIfNeeded();
     }
-    const dueItems = candidates.filter(i => i.nextReviewDate <= Date.now()).sort((a, b) => a.masteryLevel - b.masteryLevel);
+  }, [currentIndex, isInitializing, prefetchMoreIfNeeded]);
 
-    if (dueItems.length === 0) {
-      return candidates[Math.floor(Math.random() * candidates.length)];
-    }
-    return dueItems[0];
-  }, [corpus]);
-
-  // --- Scenario Loading ---
-
-  const loadScenario = useCallback(async (item: CorpusItem, isRetry: boolean, currentTopic: string) => {
-    // 1. If we have next item pre-fetched, use it
-    if (!isRetry && nextItem?.id === item.id && nextContext) {
-      setCurrentItem(nextItem);
-      setContext(nextContext);
-      setNextItem(null);
-      setNextContext(null);
-      setCachedRefAudio(null);
-      setInputText("");
-      return;
-    }
-
-    setIsLoading(true);
-    setCachedRefAudio(null);
-    setInputText("");
-
-    // 2. Try Cache (if not a retry)
-    const cacheKey = `yuliaocool_learn_session_${item.id}`;
-    if (!isRetry) {
-      const cached = localStorage.getItem(cacheKey);
-      if (cached) {
-        try {
-          const { context: cachedCtx, topic: cachedTopic, timestamp } = JSON.parse(cached);
-          // Validate: same topic + not expired
-          if (cachedTopic === currentTopic && (Date.now() - timestamp < CACHE_EXPIRY_MS)) {
-            // Simulate loading delay for better UX
-            await new Promise(r => setTimeout(r, 600));
-            setContext(cachedCtx);
-            setCurrentItem(item);
-            setIsLoading(false);
-            return;
+  // === 音频预取（延迟执行，降低优先级）===
+  useEffect(() => {
+    if (context?.englishReference && !cachedRefAudio && !isInitializing) {
+      const timer = setTimeout(() => {
+        const prefetchAudio = async () => {
+          try {
+            const base64 = await generateSpeech(context.englishReference);
+            if (base64) setCachedRefAudio(base64);
+          } catch (e) {
+            console.error("Audio prefetch failed", e);
           }
-        } catch (e) {
-          localStorage.removeItem(cacheKey);
-        }
-      }
+        };
+        prefetchAudio();
+      }, 1000); // 延迟 1 秒，确保不与上下文生成竞争
+
+      return () => clearTimeout(timer);
     }
-
-    // 3. Generate Fresh Content
-    try {
-      const ctx = await generateLearnContext(item.english, isRetry, currentTopic);
-      setContext(ctx);
-      setCurrentItem(item);
-
-      // Save to Cache
-      localStorage.setItem(cacheKey, JSON.stringify({
-        context: ctx,
-        topic: currentTopic,
-        timestamp: Date.now()
-      }));
-
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [nextItem, nextContext]);
-
-  // --- Lifecycle & Prefetching ---
-
-  useEffect(() => {
-    if (!currentItem && corpus.length > 0) {
-      const first = pickNextItem();
-      if (first) loadScenario(first, false, topic);
-    }
-  }, [corpus]);
-
-  useEffect(() => {
-    if (currentItem) {
-      const next = pickNextItem(currentItem.id);
-      if (next && next.id !== currentItem.id) {
-        if (nextItem?.id !== next.id || !nextContext) {
-          setNextItem(next);
-          const fetchNext = async () => {
-            setIsPrefetching(true);
-            try {
-              const ctx = await generateLearnContext(next.english, false, topic);
-              setNextContext(ctx);
-            } catch (e) {
-              setNextItem(null);
-            } finally {
-              setIsPrefetching(false);
-            }
-          };
-          fetchNext();
-        }
-      }
-    }
-  }, [currentItem, pickNextItem, topic]);
-
-  // 音频预取
-  useEffect(() => {
-    if (context?.englishReference && !cachedRefAudio) {
-      const prefetchAudio = async () => {
-        try {
-          const base64 = await generateSpeech(context.englishReference);
-          if (base64) setCachedRefAudio(base64);
-        } catch (e) {
-          console.error("Audio prefetch failed", e);
-        }
-      };
-      prefetchAudio();
-    }
-  }, [context, cachedRefAudio]);
+  }, [context, cachedRefAudio, isInitializing]);
 
   // --- Interactions ---
 
   useEffect(() => {
     return () => {
+
       if (userAudioUrl) URL.revokeObjectURL(userAudioUrl);
       if (userAudioRef.current) {
         userAudioRef.current.pause();
@@ -397,6 +488,25 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
     }
   };
 
+  // === 重新生成当前项（用于重试场景）===
+  const regenerateCurrentItem = useCallback(async () => {
+    if (!currentItem) return;
+
+    setIsLoading(true);
+    try {
+      const ctx = await generateLearnContext(currentItem.english, true, topic);
+      setContextCache(prev => {
+        const updated = new Map(prev);
+        updated.set(currentItem.id, ctx);
+        return updated;
+      });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [currentItem, topic]);
+
   const handleResult = (mastered: boolean) => {
     if (!currentItem) return;
 
@@ -424,24 +534,19 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
         return;
       }
 
-      if (nextItem && nextContext) {
-        setCurrentItem(nextItem);
-        setContext(nextContext);
-        setNextItem(null);
-        setNextContext(null);
+      // 使用队列系统：直接推进到下一个索引
+      const nextIndex = currentIndex + 1;
+      if (nextIndex < learningQueue.length) {
+        setCurrentIndex(nextIndex);
         setRetryCount(0);
       } else {
-        const next = pickNextItem(currentItem.id);
-        if (next) {
-          setRetryCount(0);
-          loadScenario(next, false, topic);
-        } else {
-          onExit();
-        }
+        // 队列已完成
+        onExit();
       }
     } else {
+      // 重试：重新生成当前项的上下文
       setRetryCount(prev => prev + 1);
-      loadScenario(currentItem, true, topic);
+      regenerateCurrentItem();
     }
   };
 
@@ -461,21 +566,12 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
 
     // Cache Invalidation Logic
     if (oldTopic !== tempTopic) {
-      // 1. Invalidate cache for the current item because the topic changed
-      if (currentItem) {
-        localStorage.removeItem(`yuliaocool_learn_session_${currentItem.id}`);
-      }
-
-      // 2. Clear prefetch as it might be from the old topic
-      setNextItem(null);
-      setNextContext(null);
-
-      // 3. Reload current scenario with new topic
-      if (currentItem) {
-        loadScenario(currentItem, false, tempTopic);
-      }
+      // 主题变更，需要重新初始化会话
+      setContextCache(new Map());
+      initSession(tempTopic, tempTarget);
     }
   };
+
 
   const dismissOnboarding = (dontShowAgain: boolean) => {
     setShowOnboarding(false);
@@ -508,15 +604,9 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
           <Button variant="ghost" onClick={() => {
             setIsSessionComplete(false);
             // Add another set based on the initial target configuration
-            setSessionTarget(prev => prev + initialTarget);
-
-            const next = pickNextItem(currentItem?.id);
-            if (next) {
-              setRetryCount(0);
-              loadScenario(next, false, topic);
-            } else {
-              onExit();
-            }
+            const newTarget = sessionTarget + initialTarget;
+            setSessionTarget(newTarget);
+            initSession(topic, newTarget);
           }}>再学一组</Button>
         </div>
       </div>
@@ -596,7 +686,44 @@ export const LearnMode: React.FC<LearnModeProps> = ({ corpus, onUpdateProgress, 
       </div>
 
       <div className="flex-1 flex flex-col justify-center space-y-6 min-h-fit pb-12">
-        {isLoading ? (
+        {isInitializing ? (
+          <div className="flex flex-col items-center justify-center space-y-6 py-20 animate-in fade-in duration-500">
+            <div className="relative">
+              <div className="w-20 h-20 rounded-full border-4 border-stone-100 border-t-stone-800 animate-spin"></div>
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="text-lg font-bold text-stone-600">{initProgress}%</span>
+              </div>
+            </div>
+            <div className="text-center space-y-2">
+              <p className="text-stone-600 font-medium">正在快速准备学习场景...</p>
+              <p className="text-stone-400 text-sm">首批 {Math.min(INITIAL_BATCH_SIZE, learningQueue.length)} 题并行生成中</p>
+            </div>
+            <div className="w-64 h-2 bg-stone-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-stone-800 transition-all duration-300 ease-out rounded-full"
+                style={{ width: `${initProgress}%` }}
+              ></div>
+            </div>
+            {learningQueue.length > 0 && (
+              <div className="bg-white p-4 rounded-xl border border-stone-100 shadow-sm max-w-sm w-full">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-stone-400 mb-3">本次学习词汇</p>
+                <div className="flex flex-wrap gap-2">
+                  {learningQueue.slice(0, INITIAL_BATCH_SIZE).map((item, i) => (
+                    <span
+                      key={item.id}
+                      className={`text-xs px-2 py-1 rounded-full border transition-all duration-300 ${i < Math.floor((initProgress / 100) * Math.min(INITIAL_BATCH_SIZE, learningQueue.length))
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        : 'bg-stone-50 border-stone-100 text-stone-400'
+                        }`}
+                    >
+                      {item.english}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ) : isLoading ? (
           <div className="flex flex-col items-center justify-center space-y-4 animate-pulse py-20">
             <div className="h-4 w-3/4 bg-stone-200 rounded"></div>
             <div className="h-32 w-full bg-stone-100 rounded-xl"></div>

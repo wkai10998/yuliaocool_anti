@@ -118,6 +118,60 @@ export const ReviewMode: React.FC<ReviewModeProps> = ({ corpus, onExit, onAddIte
     const [isRefLoading, setIsRefLoading] = useState(false);
     const [refAudioCache, setRefAudioCache] = useState<string | null>(null);
 
+    // === 后台预取下一关 ===
+    const [nextScenarioCache, setNextScenarioCache] = useState<{
+        scenario: ContextScenario;
+        phrases: string[];
+        topic: string;
+    } | null>(null);
+    const isPrefetchingRef = useRef(false);
+
+    // === 智能选词：优先选择待复习的词汇 ===
+    const selectSmartPhrases = (count: number): string[] => {
+        const now = Date.now();
+
+        // 1. 优先选择到期需要复习的
+        const dueItems = corpus
+            .filter(c => c.nextReviewDate <= now)
+            .sort((a, b) => a.masteryLevel - b.masteryLevel);
+
+        // 2. 其次选择掌握度低的
+        const otherItems = corpus
+            .filter(c => c.nextReviewDate > now)
+            .sort((a, b) => a.masteryLevel - b.masteryLevel);
+
+        const combined = [...dueItems, ...otherItems];
+
+        // 随机打乱但保持优先级（前 count*2 个中随机选）
+        const pool = combined.slice(0, Math.max(count * 2, combined.length));
+        const shuffled = pool.sort(() => 0.5 - Math.random());
+
+        return shuffled.slice(0, count).map(c => c.english);
+    };
+
+    // === 后台预取下一关 ===
+    const prefetchNextScenario = async () => {
+        if (isPrefetchingRef.current || corpus.length === 0) return;
+        isPrefetchingRef.current = true;
+
+        try {
+            console.log('[ReviewMode] 开始后台预取下一关...');
+            const nextPhrases = selectSmartPhrases(sessionTarget > 0 ? sessionTarget : 5);
+            const nextResult = await generateContextScenario(nextPhrases, topic);
+
+            setNextScenarioCache({
+                scenario: nextResult,
+                phrases: nextPhrases,
+                topic: topic
+            });
+            console.log('[ReviewMode] 下一关预取完成');
+        } catch (e) {
+            console.warn('[ReviewMode] 预取失败:', e);
+        } finally {
+            isPrefetchingRef.current = false;
+        }
+    };
+
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const audioChunksRef = useRef<Blob[]>([]);
     const recognitionRef = useRef<any>(null);
@@ -175,7 +229,9 @@ export const ReviewMode: React.FC<ReviewModeProps> = ({ corpus, onExit, onAddIte
         const currentTopic = overrideTopic || topic;
 
         const countToPick = currentCount > 0 ? currentCount : 5;
-        const items = [...corpus].sort(() => 0.5 - Math.random()).slice(0, countToPick).map(c => c.english);
+
+        // 使用智能选词
+        const items = selectSmartPhrases(countToPick);
         setSelectedPhrases(items);
 
         try {
@@ -187,6 +243,10 @@ export const ReviewMode: React.FC<ReviewModeProps> = ({ corpus, onExit, onAddIte
                 timestamp: Date.now()
             }));
             setStep('active');
+
+            // 完成后触发后台预取下一关
+            setNextScenarioCache(null); // 清除旧缓存
+            setTimeout(() => prefetchNextScenario(), 1000);
         } catch (e: any) {
             console.error("Scenario load failed:", e);
             setLoadingError(e?.message || "网络请求超时，请检查您的网络环境并重试。");
@@ -220,7 +280,33 @@ export const ReviewMode: React.FC<ReviewModeProps> = ({ corpus, onExit, onAddIte
     const handleNextLevel = () => {
         localStorage.removeItem(CACHE_KEY);
         setSessionCount(prev => prev + 1);
-        handleStart();
+        setFeedback(null);
+        setTranscript("");
+        setRealtimeCaption("");
+        setCompletedPhrases(new Set());
+        setRecordingError(null);
+        setRefAudioCache(null);
+        transcriptRef.current = "";
+
+        // 如果有预取的缓存且主题匹配，直接使用（瞬间切换）
+        if (nextScenarioCache && nextScenarioCache.topic === topic) {
+            console.log('[ReviewMode] 使用预取缓存，瞬间切换');
+            setScenario(nextScenarioCache.scenario);
+            setSelectedPhrases(nextScenarioCache.phrases);
+            localStorage.setItem(CACHE_KEY, JSON.stringify({
+                scenario: nextScenarioCache.scenario,
+                topic: nextScenarioCache.topic,
+                timestamp: Date.now()
+            }));
+            setStep('active');
+
+            // 清除已用缓存并预取下一关
+            setNextScenarioCache(null);
+            setTimeout(() => prefetchNextScenario(), 500);
+        } else {
+            // 没有缓存，正常加载
+            handleStart();
+        }
     };
 
     const startRecording = async () => {
